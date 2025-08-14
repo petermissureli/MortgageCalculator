@@ -1,373 +1,345 @@
+# mortgage_analyzer_app.py
+# Streamlit Mortgage Analyzer with 4 scenarios, charts, and PDF export
+# - 3 internal options with lender credits
+# - 1 external lender option
+# - Comparison charts + per-scenario payoff charts
+# - One-click multipage PDF export
+#
+# Run: streamlit run mortgage_analyzer_app.py
 
-import math
+from __future__ import annotations
 import io
+from dataclasses import dataclass
+from typing import Dict, List
+
+import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
-st.set_page_config(page_title="Mortgage & Eligibility Analyzer", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="Mortgage Analyzer", layout="wide")
 
-# ---------- Utility functions ----------
-def pmt(rate_annual_pct, n_years, principal):
-    r = (rate_annual_pct/100.0)/12.0
-    n = int(n_years*12)
-    if n == 0:
-        return 0.0
+# ---------- Core math ----------
+
+@dataclass
+class MortgageInputs:
+    name: str
+    home_price: float
+    down_payment: float
+    annual_rate_pct: float
+    term_years: int
+    property_tax_annual: float = 0.0
+    insurance_annual: float = 0.0
+    hoa_monthly: float = 0.0
+    lender_credit_pct: float = 0.0   # % of loan amount credited to closing costs (negative means points)
+    est_closing_costs_pct: float = 0.03
+    extra_principal_monthly: float = 0.0
+
+def monthly_payment(principal: float, annual_rate_pct: float, term_years: int) -> float:
+    r = (annual_rate_pct / 100.0) / 12.0
+    n = term_years * 12
     if r == 0:
         return principal / n
-    return principal * (r * (1 + r)**n) / ((1 + r)**n - 1)
+    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
-def currency(x): return f"${x:,.0f}"
-def pct(x): return f"{x:.2f}%"
+def build_amortization(inputs: MortgageInputs) -> pd.DataFrame:
+    loan_amount = inputs.home_price - inputs.down_payment
+    r = (inputs.annual_rate_pct / 100.0) / 12.0
+    n = inputs.term_years * 12
 
-def va_funding_fee_pct(down_frac, first_use=True):
-    # Simplified VA tiers (first-use / subsequent use)
-    if not first_use:
-        if down_frac < 0.05: return 0.036
-        if down_frac < 0.10: return 0.0175
-        return 0.015
-    if down_frac < 0.05: return 0.0215
-    if down_frac < 0.10: return 0.015
-    return 0.0125
+    base_pmt = monthly_payment(loan_amount, inputs.annual_rate_pct, inputs.term_years)
+    tax_m = inputs.property_tax_annual / 12.0
+    ins_m = inputs.insurance_annual / 12.0
+    hoa_m = inputs.hoa_monthly
 
-def temp_buydown_yearly_rates(base_rate, scheme):
-    # scheme: "Permanent", "2-1", "3-2-1"
-    if scheme == "2-1":
-        return [base_rate-2.0, base_rate-1.0]
-    if scheme == "3-2-1":
-        return [base_rate-3.0, base_rate-2.0, base_rate-1.0]
-    return []
+    bal = loan_amount
+    rows = []
+    for m in range(1, n + 1):
+        interest = bal * r
+        principal = base_pmt - interest + inputs.extra_principal_monthly
+        if principal > bal:
+            principal = bal
+        bal -= principal
+        rows.append({
+            "Month": m,
+            "Payment_PnI": base_pmt + inputs.extra_principal_monthly,
+            "Interest": interest,
+            "Principal": principal,
+            "Escrow_Tax": tax_m,
+            "Escrow_Ins": ins_m,
+            "HOA": hoa_m,
+            "Total_Outlay": (base_pmt + inputs.extra_principal_monthly) + tax_m + ins_m + hoa_m,
+            "Balance": bal
+        })
+        if bal <= 1e-6:
+            break
 
-def present_value_of_diffs(diffs, base_rate_pct, term_years):
-    i = (base_rate_pct/100.0)/12.0
-    pv = 0.0
-    m = 0
-    for months, diff in diffs:
-        for _ in range(months):
-            m += 1
-            pv += (diff / ((1+i)**m)) if i>0 else diff
-    return pv
+    df = pd.DataFrame(rows)
 
-# ---------- Sidebar: Assumptions ----------
+    upfront_base = loan_amount * inputs.est_closing_costs_pct
+    lender_credit = loan_amount * inputs.lender_credit_pct
+    upfront_net = max(upfront_base - lender_credit, 0.0)
+
+    df.attrs["loan_amount"] = loan_amount
+    df.attrs["base_pmt"] = base_pmt
+    df.attrs["total_interest"] = float(df["Interest"].sum())
+    df.attrs["months_to_payoff"] = len(df)
+    df.attrs["upfront_base"] = upfront_base
+    df.attrs["lender_credit"] = lender_credit
+    df.attrs["upfront_net"] = upfront_net
+    df.attrs["total_outlay_all_in"] = float(df["Total_Outlay"].sum() + upfront_net)
+    return df
+
+# ---------- UI: Sidebar inputs ----------
+
+st.title("Mortgage Analyzer — 4-Scenario Comparison")
+
 with st.sidebar:
-    st.header("Assumptions & Overlays")
-    closing_cost_pct = st.number_input("Estimated Closing Costs (% of Price)", value=3.0, step=0.25, min_value=0.0) / 100
-    tax_rate = st.number_input("Property Tax Rate (% of Price / year)", value=0.60, step=0.05, min_value=0.0) / 100
-    ins_rate = st.number_input("Homeowners Insurance (% of Price / year)", value=0.35, step=0.05, min_value=0.0) / 100
-    pmi_rate = st.number_input("PMI (Conventional) Annual Rate (% of balance)", value=0.60, step=0.10, min_value=0.0) / 100
-    fha_ufmip_pct = st.number_input("FHA Upfront MIP (% of loan)", value=1.75, step=0.10, min_value=0.0) / 100
-    fha_annual_mip = st.number_input("FHA Annual MIP (% of balance)", value=0.55, step=0.05, min_value=0.0) / 100
+    st.header("Assumptions")
+    home_price = st.number_input("Home price", value=550_000.0, min_value=10_000.0, step=1000.0, format="%.2f")
+    down_payment = st.number_input("Down payment", value=110_000.0, min_value=0.0, step=1000.0, format="%.2f")
+    term_years = st.number_input("Term (years)", value=30, min_value=5, max_value=40, step=5)
+    property_tax_annual = st.number_input("Property tax (annual)", value=5_000.0, min_value=0.0, step=100.0, format="%.2f")
+    insurance_annual = st.number_input("Homeowners insurance (annual)", value=1_800.0, min_value=0.0, step=50.0, format="%.2f")
+    hoa_monthly = st.number_input("HOA (monthly)", value=60.0, min_value=0.0, step=5.0, format="%.2f")
+    extra_principal_monthly = st.number_input("Extra principal (monthly)", value=0.0, min_value=0.0, step=25.0, format="%.2f")
+    est_closing_costs_pct = st.number_input("Baseline closing costs (% of loan)", value=3.0, min_value=0.0, max_value=10.0, step=0.1) / 100.0
 
-    st.divider()
-    st.caption("Eligibility thresholds (edit to match your overlays)")
-    min_credit_conv = st.number_input("Min Credit Conventional", value=620, step=10)
-    min_credit_fha = st.number_input("Min Credit FHA", value=580, step=10)
-    min_credit_va = st.number_input("Min Credit VA", value=580, step=10)
-    max_dti_conv = st.number_input("Max DTI Conventional", value=45.0, step=1.0) / 100
-    max_dti_fha  = st.number_input("Max DTI FHA", value=50.0, step=1.0) / 100
-    max_dti_va   = st.number_input("Max DTI VA", value=55.0, step=1.0) / 100
+    st.markdown("---")
+    st.subheader("Scenario Rates & Credits")
+    colA, colB = st.columns(2)
+    with colA:
+        rate_int_A = st.number_input("Internal A rate (%)", value=5.875, step=0.01, format="%.3f")
+        rate_int_B = st.number_input("Internal B rate (%)", value=6.000, step=0.01, format="%.3f")
+    with colB:
+        rate_int_C = st.number_input("Internal C rate (%)", value=6.125, step=0.01, format="%.3f")
+        rate_ext   = st.number_input("External rate (%)",   value=5.750, step=0.01, format="%.3f")
 
-    st.divider()
-    st.caption("Pricing (simplified)")
-    points_pct = st.number_input("Discount/Origination Points (% of loan)", value=0.00, step=0.125, min_value=0.0) / 100
-    rate_reduction_per_point = st.number_input("Rate Reduction per 1.0 Point (bps)", value=25, step=5, min_value=0) / 100  # 25 bps = 0.25%
-    apply_points_to_builder_rate = st.checkbox("Apply points to Builder rate", value=False)
+    colC, colD = st.columns(2)
+    with colC:
+        credit_A_pct = st.number_input("Internal A lender credit (%)", value=1.0, step=0.25, format="%.2f")/100.0
+        credit_B_pct = st.number_input("Internal B lender credit (%)", value=1.5, step=0.25, format="%.2f")/100.0
+    with colD:
+        credit_C_pct = st.number_input("Internal C lender credit (%)", value=2.0, step=0.25, format="%.2f")/100.0
+        credit_ext_pct = st.number_input("External lender credit (%)", value=0.0, step=0.25, format="%.2f")/100.0
 
-# ---------- Main Inputs ----------
-st.title("🏠 Mortgage & Eligibility Analyzer")
-st.caption("Compare builder vs outside lender, apply incentives (price reduction, closing credit, rate buydown), and evaluate program eligibility.")
+# ---------- Build scenarios ----------
 
-colA, colB, colC = st.columns(3)
-with colA:
-    price = st.number_input("Home Price ($)", value=550000, step=1000, min_value=0)
-    down_payment = st.number_input("Down Payment ($)", value=30000, step=1000, min_value=0)
-    hoa = st.number_input("HOA Dues ($/mo)", value=0, step=10, min_value=0)
-    occ = st.selectbox("Occupancy", ["Primary","Second Home","Investment"])
-with colB:
-    credit_score = st.number_input("Credit Score", value=700, step=1, min_value=300, max_value=900)
-    gross_monthly_income = st.number_input("Gross Monthly Income ($)", value=11000, step=100, min_value=0)
-    existing_monthly_debts = st.number_input("Existing Monthly Debts ($)", value=1200, step=50, min_value=0)
-with colC:
-    loan_term = st.number_input("Loan Term (years)", value=30, step=5, min_value=5, max_value=40)
-    rate_builder = st.number_input("Builder Lender Rate (%)", value=6.75, step=0.125, min_value=0.0)
-    rate_outside = st.number_input("Outside Lender Rate (%)", value=7.00, step=0.125, min_value=0.0)
+def make_scenarios() -> List[MortgageInputs]:
+    base = dict(
+        home_price=home_price,
+        down_payment=down_payment,
+        term_years=term_years,
+        property_tax_annual=property_tax_annual,
+        insurance_annual=insurance_annual,
+        hoa_monthly=hoa_monthly,
+        extra_principal_monthly=extra_principal_monthly,
+        est_closing_costs_pct=est_closing_costs_pct,
+    )
+    return [
+        MortgageInputs(name="Internal A (Credit 1%)", annual_rate_pct=rate_int_A, lender_credit_pct=credit_A_pct, **base),
+        MortgageInputs(name="Internal B (Credit 1.5%)", annual_rate_pct=rate_int_B, lender_credit_pct=credit_B_pct, **base),
+        MortgageInputs(name="Internal C (Credit 2%)", annual_rate_pct=rate_int_C, lender_credit_pct=credit_C_pct, **base),
+        MortgageInputs(name="External (No / Custom Credit)", annual_rate_pct=rate_ext, lender_credit_pct=credit_ext_pct, **base),
+    ]
 
-elig_cols = st.columns(5)
-with elig_cols[0]:
-    va_eligible = st.selectbox("VA Eligible?", ["No","Yes"])
-with elig_cols[1]:
-    va_first_use = st.selectbox("VA First Use?", ["Yes","No"])
-with elig_cols[2]:
-    usda_eligible = st.selectbox("USDA Eligible? (basic flag)", ["No","Yes"])
-with elig_cols[3]:
-    recent_bk = st.selectbox("Bankruptcy in last 4 yrs?", ["No","Yes"])
-with elig_cols[4]:
-    recent_fc = st.selectbox("Foreclosure in last 7 yrs?", ["No","Yes"])
+scenarios = make_scenarios()
 
-st.divider()
+# ---------- Compute & summarize ----------
 
-# ---------- Incentive Controls ----------
-st.subheader("Builder Incentive")
-inc_type = st.selectbox("Incentive Type", ["ClosingCredit", "PriceReduction", "RateBuydown"])
-inc_amount = st.number_input("Incentive Amount ($)", value=10000, step=1000, min_value=0)
+schedules: Dict[str, pd.DataFrame] = {}
+summary_rows: List[Dict[str, float]] = []
 
-# Rate buydown flavor
-buydown_scheme = "Permanent"
-if inc_type == "RateBuydown":
-    buydown_scheme = st.selectbox("Buydown Scheme", ["Permanent", "2-1", "3-2-1"])
-    if buydown_scheme == "Permanent":
-        st.info("Enter the **reduced builder rate** after buydown.")
-        rate_builder = st.number_input("Builder Lender Rate After Permanent Buydown (%)", value=6.25, step=0.125, min_value=0.0)
+for sc in scenarios:
+    df = build_amortization(sc)
+    schedules[sc.name] = df
+    summary_rows.append({
+        "Scenario": sc.name,
+        "Rate_%": sc.annual_rate_pct,
+        "Loan_Amount": df.attrs["loan_amount"],
+        "Monthly_P&I": round(df.attrs["base_pmt"], 2),
+        "Escrow+HOA": round((sc.property_tax_annual/12.0) + (sc.insurance_annual/12.0) + sc.hoa_monthly, 2),
+        "Months_to_Payoff": df.attrs["months_to_payoff"],
+        "Total_Interest": round(df.attrs["total_interest"], 2),
+        "Upfront_Base": round(df.attrs["upfront_base"], 2),
+        "Lender_Credit": round(df.attrs["lender_credit"], 2),
+        "Upfront_Net": round(df.attrs["upfront_net"], 2),
+        "Total_All_In_Outlay": round(df.attrs["total_outlay_all_in"], 2),
+    })
 
-# Apply points to rate (optional)
-if apply_points_to_builder_rate and points_pct > 0:
-    rate_builder = max(0.0, rate_builder - (rate_reduction_per_point * (points_pct*100)))  # fraction -> points
+summary_df = pd.DataFrame(summary_rows)
 
-# Adjusted price when price reduction is selected
-adj_price = price - inc_amount if inc_type == "PriceReduction" else price
+st.subheader("Scenario Summary")
+st.dataframe(
+    summary_df.style.format({
+        "Rate_%": "{:.3f}",
+        "Loan_Amount": "${:,.0f}",
+        "Monthly_P&I": "${:,.2f}",
+        "Escrow+HOA": "${:,.2f}",
+        "Total_Interest": "${:,.0f}",
+        "Upfront_Base": "${:,.0f}",
+        "Lender_Credit": "${:,.0f}",
+        "Upfront_Net": "${:,.0f}",
+        "Total_All_In_Outlay": "${:,.0f}",
+    }),
+    use_container_width=True,
+)
 
-# ---------- Scenarios ----------
-st.subheader("Scenarios")
-default_scenarios = [
-    {"name": "Scenario 1 (Builder Lender)", "rate": rate_builder, "use_incentive": True},
-    {"name": "Scenario 2 (Outside Lender)", "rate": rate_outside, "use_incentive": False},
-    {"name": "Scenario 3 (Custom)", "rate": rate_builder, "use_incentive": True},
-]
+# ---------- Charts (Matplotlib) ----------
 
-scenario_data = []
-for i, base in enumerate(default_scenarios, start=1):
-    with st.expander(base["name"], expanded=(i==1)):
-        scen_name = st.text_input("Scenario Name", value=base["name"], key=f"name_{i}")
-        scen_rate = st.number_input("Note Rate (%)", value=float(base["rate"]), step=0.125, key=f"rate_{i}")
-        scen_use_inc = st.selectbox("Use Builder Incentive?", ["Yes","No"], index=0 if base["use_incentive"] else 1, key=f"useinc_{i}")
-        scen_down = st.number_input("Down Payment ($)", value=down_payment, step=1000, min_value=0, key=f"down_{i}")
+def fig_monthly_pi_bar() -> plt.Figure:
+    labels = summary_df["Scenario"].tolist()
+    vals = summary_df["Monthly_P&I"].values
+    x = np.arange(len(labels))
+    fig = plt.figure(figsize=(9, 4))
+    plt.bar(x, vals)
+    plt.xticks(x, labels, rotation=15, ha="right")
+    plt.ylabel("Monthly P&I ($)")
+    plt.title("Monthly Principal & Interest by Scenario")
+    for i, v in enumerate(vals):
+        plt.text(i, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    return fig
 
-        scen_price = adj_price if (inc_type=="PriceReduction" and scen_use_inc=="Yes") else price
-        closing_credit = inc_amount if (inc_type=="ClosingCredit" and scen_use_inc=="Yes") else 0
+def fig_upfront_net_bar() -> plt.Figure:
+    labels = summary_df["Scenario"].tolist()
+    vals = summary_df["Upfront_Net"].values
+    x = np.arange(len(labels))
+    fig = plt.figure(figsize=(9, 4))
+    plt.bar(x, vals)
+    plt.xticks(x, labels, rotation=15, ha="right")
+    plt.ylabel("Net Upfront ($)")
+    plt.title("Net Upfront Costs (after Lender Credits)")
+    for i, v in enumerate(vals):
+        plt.text(i, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    return fig
 
-        base_loan = max(0.0, scen_price - scen_down)
+def fig_total_interest_bar() -> plt.Figure:
+    labels = summary_df["Scenario"].tolist()
+    vals = summary_df["Total_Interest"].values
+    x = np.arange(len(labels))
+    fig = plt.figure(figsize=(9, 4))
+    plt.bar(x, vals)
+    plt.xticks(x, labels, rotation=15, ha="right")
+    plt.ylabel("Total Interest ($)")
+    plt.title("Total Interest over Life of Loan")
+    for i, v in enumerate(vals):
+        plt.text(i, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    return fig
 
-        # Program hint
-        prog_hint = "VA" if va_eligible=="Yes" else ("FHA" if credit_score < min_credit_conv else "Conventional")
+def fig_payoff_lines(name: str, df: pd.DataFrame) -> plt.Figure:
+    fig = plt.figure(figsize=(9, 4))
+    plt.plot(df["Month"], df["Interest"], label="Interest Portion")
+    plt.plot(df["Month"], df["Principal"], label="Principal Portion")
+    plt.xlabel("Month")
+    plt.ylabel("Dollars")
+    plt.title(f"{name}: Monthly P&I Breakdown")
+    plt.legend()
+    fig.tight_layout()
+    return fig
 
-        # Finance FHA UFMIP or VA funding fee
-        fhava_note = ""
-        loan_amount = base_loan
-        upfront_costs_financed = 0.0
-        if prog_hint == "FHA":
-            ufmip = base_loan * fha_ufmip_pct
-            loan_amount = base_loan + ufmip
-            upfront_costs_financed = ufmip
-            fhava_note = f"FHA UFMIP financed: {currency(ufmip)}"
-        elif prog_hint == "VA":
-            down_frac = scen_down / scen_price if scen_price else 0.0
-            fee_pct = va_funding_fee_pct(down_frac, first_use=(va_first_use=="Yes"))
-            va_fee = base_loan * fee_pct
-            loan_amount = base_loan + va_fee
-            upfront_costs_financed = va_fee
-            fhava_note = f"VA Funding Fee ({pct(fee_pct*100)} of base loan) financed: {currency(va_fee)}"
+def fig_cum_lines(name: str, df: pd.DataFrame) -> plt.Figure:
+    fig = plt.figure(figsize=(9, 4))
+    plt.plot(df["Month"], df["Principal"].cumsum(), label="Cumulative Principal")
+    plt.plot(df["Month"], df["Interest"].cumsum(), label="Cumulative Interest")
+    plt.xlabel("Month")
+    plt.ylabel("Dollars")
+    plt.title(f"{name}: Cumulative Principal vs Interest")
+    plt.legend()
+    fig.tight_layout()
+    return fig
 
-        monthly_tax = scen_price * tax_rate / 12.0
-        monthly_ins = scen_price * ins_rate / 12.0
+c1, c2 = st.columns(2)
+with c1:
+    st.pyplot(fig_monthly_pi_bar(), use_container_width=True)
+with c2:
+    st.pyplot(fig_upfront_net_bar(), use_container_width=True)
 
-        ltv = loan_amount / scen_price if scen_price else 0.0
-        if prog_hint == "Conventional" and ltv > 0.80:
-            pmi_mip = loan_amount * pmi_rate / 12.0
-        elif prog_hint == "FHA":
-            pmi_mip = loan_amount * fha_annual_mip / 12.0
-        else:
-            pmi_mip = 0.0
+st.pyplot(fig_total_interest_bar(), use_container_width=True)
 
-        monthly_pi = pmt(scen_rate, loan_term, loan_amount)
+st.markdown("### Per-Scenario Payoff Views")
+for sc in scenarios:
+    df = schedules[sc.name]
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        st.pyplot(fig_payoff_lines(sc.name, df), use_container_width=True)
+    with pc2:
+        st.pyplot(fig_cum_lines(sc.name, df), use_container_width=True)
+    # Offer CSV for this scenario
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label=f"Download amortization CSV — {sc.name}",
+        data=csv,
+        file_name=f"{sc.name.replace(' ', '_').replace('(', '').replace(')', '')}_Amortization.csv",
+        mime="text/csv",
+        key=f"csv_{sc.name}",
+    )
+    st.markdown("---")
 
-        buydown_details = {}
-        if inc_type == "RateBuydown" and scen_use_inc == "Yes" and i == 1:
-            if buydown_scheme in ["2-1", "3-2-1"]:
-                yr_rates = []
-                if buydown_scheme == "2-1":
-                    yr_rates = [scen_rate-2.0, scen_rate-1.0]
-                elif buydown_scheme == "3-2-1":
-                    yr_rates = [scen_rate-3.0, scen_rate-2.0, scen_rate-1.0]
-                payments = []
-                diffs = []
-                for idx, r in enumerate(yr_rates, start=1):
-                    pay = pmt(r, loan_term, loan_amount)
-                    payments.append((idx, r, pay))
-                    diffs.append((12, monthly_pi - pay))
-                buydown_cost_pv = present_value_of_diffs(diffs, scen_rate, loan_term)
-                buydown_cost_naive = sum(12*diff for _, diff in diffs)
-                buydown_details = {"scheme": buydown_scheme, "yearly_payments": payments, "pv_cost": buydown_cost_pv, "sum_cost": buydown_cost_naive}
+# ---------- PDF export (multi-page) ----------
 
-        piti = monthly_pi + monthly_tax + monthly_ins + pmi_mip + hoa
-        dti = (existing_monthly_debts + piti) / gross_monthly_income if gross_monthly_income else 0.0
+def build_pdf() -> bytes:
+    buf = io.BytesIO()
+    with PdfPages(buf) as pp:
+        # Cover
+        fig = plt.figure(figsize=(8.5, 11))
+        plt.axis("off")
+        plt.text(0.5, 0.92, "Mortgage Scenarios Report", ha="center", va="center", fontsize=22, weight="bold")
+        plt.text(0.5, 0.885, "3 Internal Options (with lender credits) + 1 External Lender", ha="center", va="center", fontsize=11)
+        assumptions = [
+            f"Home price: ${home_price:,.0f}",
+            f"Down payment: ${down_payment:,.0f}",
+            f"Term: {term_years} years",
+            f"Property tax (annual): ${property_tax_annual:,.0f}",
+            f"Insurance (annual): ${insurance_annual:,.0f}",
+            f"HOA (monthly): ${hoa_monthly:,.0f}",
+            f"Baseline closing costs: {est_closing_costs_pct*100:.2f}% of loan",
+            f"Extra principal (monthly): ${extra_principal_monthly:,.0f}",
+        ]
+        y = 0.82
+        for line in assumptions:
+            plt.text(0.08, y, f"• {line}", fontsize=10, va="top")
+            y -= 0.04
+        pp.savefig(fig); plt.close(fig)
 
-        conv_ok = (credit_score >= min_credit_conv) and (dti <= max_dti_conv) and (recent_bk=="No") and (recent_fc=="No")
-        fha_ok  = (credit_score >= min_credit_fha) and (dti <= max_dti_fha)
-        va_ok   = (va_eligible=="Yes") and (credit_score >= min_credit_va) and (dti <= max_dti_va) and (occ=="Primary")
+        # Comparison charts
+        for make_fig in (fig_monthly_pi_bar, fig_upfront_net_bar, fig_total_interest_bar):
+            fig = make_fig()
+            fig.set_size_inches(11, 8.5)
+            pp.savefig(fig); plt.close(fig)
 
-        est_closing_costs = scen_price * closing_cost_pct + (points_pct * base_loan)
-        cash_to_close = scen_down + max(0.0, est_closing_costs - closing_credit)
+        # Summary table as text
+        fig = plt.figure(figsize=(11, 8.5))
+        plt.axis("off")
+        plt.title("Scenario Summary", loc="left", fontsize=14, pad=12)
+        y = 0.88
+        for _, row in summary_df.iterrows():
+            line = (
+                f"{row['Scenario']}:  Rate {row['Rate_%']:.3f}%,  P&I ${row['Monthly_P&I']:,.2f},  "
+                f"Upfront Net ${row['Upfront_Net']:,.0f},  Total Interest ${row['Total_Interest']:,.0f},  "
+                f"All-in ${row['Total_All_In_Outlay']:,.0f}"
+            )
+            plt.text(0.03, y, line, fontsize=10, va="top")
+            y -= 0.05
+        pp.savefig(fig); plt.close(fig)
 
-        warning_msgs = []
-        if occ != "Primary" and prog_hint in ["FHA","VA","USDA"]:
-            warning_msgs.append("Government programs generally require **primary occupancy**.")
-        if prog_hint == "Conventional" and ltv > 0.95:
-            warning_msgs.append("High LTV Conventional may require special programs or pricing.")
-        if prog_hint == "FHA" and ltv > 0.965:
-            warning_msgs.append("FHA max LTV/loan limits may apply—verify guidelines for your county.")
-        if prog_hint == "VA" and va_eligible == "No":
-            warning_msgs.append("VA selected but borrower not flagged as VA-eligible.")
-        if inc_type == "RateBuydown" and scen_use_inc=="Yes" and buydown_details:
-            if inc_amount < buydown_details["pv_cost"]:
-                warning_msgs.append("Incentive may be insufficient to fully fund the temporary buydown (PV of subsidy exceeds incentive).")
+        # Per-scenario pages
+        for sc in scenarios:
+            df = schedules[sc.name]
+            for maker in (fig_payoff_lines, fig_cum_lines):
+                fig = maker(sc.name, df)
+                fig.set_size_inches(11, 8.5)
+                pp.savefig(fig); plt.close(fig)
+    return buf.getvalue()
 
-        scenario_data.append(dict(
-            name=scen_name,
-            price=scen_price,
-            note_rate=scen_rate,
-            down=scen_down,
-            loan_amount=loan_amount,
-            base_loan=base_loan,
-            financed_upfront=upfront_costs_financed,
-            monthly_pi=monthly_pi,
-            monthly_tax=monthly_tax,
-            monthly_ins=monthly_ins,
-            hoa=hoa,
-            pmi_mip=pmi_mip,
-            piti=piti,
-            dti=dti,
-            closing_credit=closing_credit,
-            est_closing_costs=est_closing_costs,
-            cash_to_close=cash_to_close,
-            program_hint=prog_hint,
-            conv_ok=conv_ok,
-            fha_ok=fha_ok,
-            va_ok=va_ok,
-            fhava_note=fhava_note,
-            buydown_details=buydown_details,
-            warnings=warning_msgs
-        ))
-
-# ---------- Summary ----------
-df = pd.DataFrame([{
-    "Scenario": s["name"],
-    "Price": s["price"],
-    "Rate %": s["note_rate"],
-    "Down $": s["down"],
-    "Loan $": s["loan_amount"],
-    "Financed Upfront $": s["financed_upfront"],
-    "P&I $/mo": s["monthly_pi"],
-    "Tax $/mo": s["monthly_tax"],
-    "Ins $/mo": s["monthly_ins"],
-    "PMI/MIP $/mo": s["pmi_mip"],
-    "HOA $/mo": s["hoa"],
-    "PITI $/mo": s["piti"],
-    "DTI": s["dti"],
-    "Est Closing Costs $": s["est_closing_costs"],
-    "Builder Closing Credit $": s["closing_credit"],
-    "Cash to Close $": s["cash_to_close"],
-    "Program Hint": s["program_hint"],
-    "Conv OK": s["conv_ok"],
-    "FHA OK": s["fha_ok"],
-    "VA OK": s["va_ok"],
-} for s in scenario_data])
-
-st.subheader("Summary")
-st.dataframe(df.style.format({
-    "Price": "${:,.0f}",
-    "Rate %": "{:.3f}",
-    "Down $": "${:,.0f}",
-    "Loan $": "${:,.0f}",
-    "Financed Upfront $": "${:,.0f}",
-    "P&I $/mo": "${:,.0f}",
-    "Tax $/mo": "${:,.0f}",
-    "Ins $/mo": "${:,.0f}",
-    "PMI/MIP $/mo": "${:,.0f}",
-    "HOA $/mo": "${:,.0f}",
-    "PITI $/mo": "${:,.0f}",
-    "DTI": "{:.1%}",
-    "Est Closing Costs $": "${:,.0f}",
-    "Builder Closing Credit $": "${:,.0f}",
-    "Cash to Close $": "${:,.0f}",
-}))
-
-# ---------- Baseline comparison ----------
-st.divider()
-st.subheader("Builder vs Outside Lender (P&I Only, baseline)")
-adj_base = adj_price if inc_type == "PriceReduction" else price
-loan_amount_base = max(0.0, adj_base - down_payment)
-rate_builder_baseline = rate_builder
-if apply_points_to_builder_rate and points_pct > 0:
-    rate_builder_baseline = max(0.0, rate_builder_baseline - (rate_reduction_per_point * (points_pct*100)))
-pi_builder = pmt(rate_builder_baseline, loan_term, loan_amount_base)
-pi_outside = pmt(rate_outside, loan_term, loan_amount_base)
-
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Builder P&I / mo", currency(pi_builder))
-with c2: st.metric("Outside Lender P&I / mo", currency(pi_outside))
-with c3: st.metric("Monthly Difference", currency(pi_outside - pi_builder))
-
-# ---------- Details & Warnings ----------
-builder_scen = next((s for s in scenario_data if "Builder" in s["name"]), None)
-if builder_scen:
-    st.subheader("Builder Scenario Details")
-    st.write(f"**Program Hint:** {builder_scen['program_hint']}")
-    if builder_scen["fhava_note"]:
-        st.write(builder_scen["fhava_note"])
-    if builder_scen["buydown_details"]:
-        bd = builder_scen["buydown_details"]
-        st.write(f"**Temporary Buydown:** {bd['scheme']}")
-        for (yr, rate, pay) in bd["yearly_payments"]:
-            st.write(f"Year {yr}: Rate {rate:.3f}% → P&I {currency(pay)}")
-        st.write(f"PV of Subsidy Cost: {currency(bd['pv_cost'])} (sum of diffs: {currency(bd['sum_cost'])})")
-    if builder_scen["warnings"]:
-        for w in builder_scen["warnings"]:
-            st.warning(w)
-
-# ---------- Downloadable Report ----------
-st.divider()
-st.subheader("Download Report")
-scenario_names = [s["name"] for s in scenario_data]
-if scenario_names:
-    selected = st.selectbox("Select Scenario for Report", options=scenario_names, index=0)
-    sel = next(s for s in scenario_data if s["name"] == selected)
-    report_html = f"""
-    <html>
-    <head><meta charset='utf-8'><title>Mortgage Report</title></head>
-    <body>
-    <h2>Mortgage Scenario Report – {sel['name']}</h2>
-    <p><strong>Program Hint:</strong> {sel['program_hint']}</p>
-    <ul>
-      <li>Price: {currency(sel['price'])}</li>
-      <li>Down: {currency(sel['down'])}</li>
-      <li>Note Rate: {sel['note_rate']:.3f}%</li>
-      <li>Loan Amount (after financed fees if any): {currency(sel['loan_amount'])}</li>
-      <li>Financed Upfront: {currency(sel['financed_upfront'])}</li>
-      <li>P&I / mo: {currency(sel['monthly_pi'])}</li>
-      <li>Taxes / mo: {currency(sel['monthly_tax'])}</li>
-      <li>Insurance / mo: {currency(sel['monthly_ins'])}</li>
-      <li>PMI/MIP / mo: {currency(sel['pmi_mip'])}</li>
-      <li>HOA / mo: {currency(sel['hoa'])}</li>
-      <li><strong>PITI / mo: {currency(sel['piti'])}</strong></li>
-      <li><strong>DTI:</strong> {sel['dti']*100:.1f}%</li>
-      <li>Est. Closing Costs: {currency(sel['est_closing_costs'])}</li>
-      <li>Builder Closing Credit: {currency(sel['closing_credit'])}</li>
-      <li><strong>Cash to Close: {currency(sel['cash_to_close'])}</strong></li>
-    </ul>
-    <p>{sel['fhava_note']}</p>
-    """
-    if sel["buydown_details"]:
-        bd = sel["buydown_details"]
-        rows = "".join([f"<li>Year {yr}: {rate:.3f}% → P&I {currency(pay)}</li>" for (yr, rate, pay) in bd["yearly_payments"]])
-        report_html += f"""
-        <h3>Temporary Buydown</h3>
-        <ul>{rows}</ul>
-        <p>PV of Subsidy Cost: {currency(bd['pv_cost'])} (sum of diffs: {currency(bd['sum_cost'])})</p>
-        """
-    if sel["warnings"]:
-        warns = "".join([f"<li>{w}</li>" for w in sel["warnings"]])
-        report_html += f"<h3>Notes & Warnings</h3><ul>{warns}</ul>"
-    report_html += "<p style='font-size:12px;color:#666'>Estimates only. Not a commitment to lend. Verify program rules, loan limits, and overlays.</p></body></html>"
-
-    st.download_button("Download HTML Report", data=report_html.encode("utf-8"), file_name="mortgage_report.html", mime="text/html")
-
-st.caption("This tool is for estimates only and not a loan offer. Customize assumptions to match your guidelines and pricing.")
+st.markdown("### Export")
+pdf_bytes = build_pdf()
+st.download_button(
+    label="📄 Download PDF report",
+    data=pdf_bytes,
+    file_name="Mortgage_Scenarios_Report.pdf",
+    mime="application/pdf",
+)
